@@ -1,0 +1,21 @@
+{
+  "config": {
+    "error": {
+      "invalid_mac": "Please enter a valid Bluetooth MAC address (AA:BB:CC:DD:EE:FF)."
+    },
+    "step": {
+        "confirm": {
+            "data": {
+                "address": "Bluetooth MAC Address",
+                "device_type": "Device Type"
+            }
+        },
+        "user": {
+            "data": {
+                "address": "Bluetooth MAC Address",
+                "device_type": "Device Type"
+            }
+        }
+    }
+  }
+}
