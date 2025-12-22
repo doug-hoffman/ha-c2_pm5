@@ -29,6 +29,9 @@ class PM5Coordinator(DataUpdateCoordinator[PM5State]):
         self.session = PM5BleSession(hass, device_type, address, self._handle_data, self._handle_available)
 
     def _handle_available(self, available: bool) -> None:
+        if available and available is not self.state.available:
+            # Clear values so we don't expose stale state
+            self.state.values = {}
         self.state.available = available
         self.async_set_updated_data(self.state)
     
