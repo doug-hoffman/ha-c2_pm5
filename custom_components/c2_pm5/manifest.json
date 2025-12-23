@@ -4,7 +4,7 @@
   "version": "2025.12.0",
   "requirements": [],
   "dependencies": ["bluetooth_adapters"],
-  "codeowners": ["doug-hoffman"],
+  "codeowners": ["@doug-hoffman"],
   "documentation": "https://github.com/doug-hoffman/ha-c2_pm5",
   "issue_tracker": "https://github.com/doug-hoffman/ha-c2_pm5/issues",
   "config_flow": true,
