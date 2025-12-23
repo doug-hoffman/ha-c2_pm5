@@ -18,6 +18,7 @@ class PM5State:
     available: bool = False
     values: dict = field(default_factory=dict)
 
+
 class PM5Coordinator(DataUpdateCoordinator[PM5State]):
     def __init__(self, hass: HomeAssistant, address: str, device_type: str):
         super().__init__(hass, _LOGGER, name=device_type, update_interval=None)
@@ -26,7 +27,9 @@ class PM5Coordinator(DataUpdateCoordinator[PM5State]):
         self.state = PM5State()
         self.async_set_updated_data(self.state)
 
-        self.session = PM5BleSession(hass, device_type, address, self._handle_data, self._handle_available)
+        self.session = PM5BleSession(
+            hass, device_type, address, self._handle_data, self._handle_available
+        )
 
     def _handle_available(self, available: bool) -> None:
         if available and available is not self.state.available:
@@ -34,7 +37,7 @@ class PM5Coordinator(DataUpdateCoordinator[PM5State]):
             self.state.values = {}
         self.state.available = available
         self.async_set_updated_data(self.state)
-    
+
     def _handle_connection(self, connected: bool) -> None:
         if self.state.connected == connected:
             return
@@ -44,6 +47,7 @@ class PM5Coordinator(DataUpdateCoordinator[PM5State]):
     def _handle_data(self, data: PM5Data) -> None:
         self.state.values.update(data.values)
         self.async_set_updated_data(self.state)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})

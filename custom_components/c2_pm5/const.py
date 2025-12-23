@@ -41,7 +41,9 @@ CSAFE_STUFF = 0xF3
 # CSAFE commands
 CSAFE_COMMAND_WRAPPER = 0x76
 CSAFE_PM_SET_DATETIME = 0x22
-TERMINATE_WORKOUT_CONTENTS = bytes([CSAFE_COMMAND_WRAPPER, 0x04, 0x13, 0x02, 0x01, 0x02])
+TERMINATE_WORKOUT_CONTENTS = bytes(
+    [CSAFE_COMMAND_WRAPPER, 0x04, 0x13, 0x02, 0x01, 0x02]
+)
 GET_DATETIME_CONTENTS = bytes([CSAFE_COMMAND_WRAPPER, 0x01, 0x85])
 
 # Guardrails
@@ -50,7 +52,7 @@ TERMINATE_GRACE_SECONDS = 10.0  # allow 0039/003A to come in before disconnect
 
 # Date/time sync guardrails
 DATETIME_SYNC_RATE_LIMIT_SECONDS = 6 * 60 * 60  # once per 6 hours
-DATETIME_SYNC_CONNECT_GRACE_SECONDS = 1.0       # let notifications settle
+DATETIME_SYNC_CONNECT_GRACE_SECONDS = 1.0  # let notifications settle
 DATETIME_SYNC_TIMEOUT_SECONDS = 5.0
 
 # ---- Enum mappings (Appendix A) ----

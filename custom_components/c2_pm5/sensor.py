@@ -77,7 +77,6 @@ SENSORS: list[PM5SensorDescription] = [
         name="Stroke State",
         icon="mdi:waveform",
     ),
-
     # ---------- 0x0032 : Performance / live metrics ----------
     PM5SensorDescription(
         key="0032_speed_m_s",
@@ -145,7 +144,6 @@ SENSORS: list[PM5SensorDescription] = [
         suggested_display_precision=2,
         icon="mdi:timer-sand",
     ),
-
     # ---------- 0x0033 : Power / intervals ----------
     PM5SensorDescription(
         key="0033_interval_count",
@@ -220,7 +218,6 @@ SENSORS: list[PM5SensorDescription] = [
         suggested_display_precision=2,
         icon="mdi:map-marker-path",
     ),
-
     # ---------- 0x0039 : End-of-workout summary ----------
     PM5SensorDescription(
         key="0039_elapsed_time_s",
@@ -312,7 +309,6 @@ SENSORS: list[PM5SensorDescription] = [
         suggested_display_precision=2,
         icon="mdi:run",
     ),
-
     # ---------- 0x003A : End-of-workout additional summary ----------
     PM5SensorDescription(
         key="003a_split_interval_type",
@@ -382,13 +378,17 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coordinator: PM5Coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([PM5Sensor(coordinator, d) for d in SENSORS], update_before_add=False)
+    async_add_entities(
+        [PM5Sensor(coordinator, d) for d in SENSORS], update_before_add=False
+    )
 
 
 class PM5Sensor(SensorEntity):
     _attr_should_poll = False
 
-    def __init__(self, coordinator: PM5Coordinator, description: PM5SensorDescription) -> None:
+    def __init__(
+        self, coordinator: PM5Coordinator, description: PM5SensorDescription
+    ) -> None:
         self.coordinator = coordinator
         self.entity_description = description
         self._attr_name = f"{coordinator.device_type} {description.name}"
@@ -407,7 +407,9 @@ class PM5Sensor(SensorEntity):
         return data.values.get(self.entity_description.key)
 
     async def async_added_to_hass(self) -> None:
-        self.async_on_remove(self.coordinator.async_add_listener(self.async_write_ha_state))
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self.async_write_ha_state)
+        )
 
     @property
     def device_info(self) -> DeviceInfo:

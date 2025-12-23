@@ -25,7 +25,7 @@ _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 def _looks_like_pm5(info: BluetoothServiceInfoBleak) -> bool:
     name = (info.name or "").lower()
-    return ("pm5" in name)
+    return "pm5" in name
 
 
 def _normalize_mac(mac: str) -> str:
@@ -71,10 +71,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
-                vol.Optional(CONF_ADDRESS, default=self._discovered_address): TextSelector(
+                vol.Optional(
+                    CONF_ADDRESS, default=self._discovered_address
+                ): TextSelector(
                     TextSelectorConfig(type=TextSelectorType.TEXT, read_only=True)
                 ),
-                vol.Required(CONF_DEVICE_TYPE, default=DEVICE_TYPES[0]): vol.In(DEVICE_TYPES),
+                vol.Required(CONF_DEVICE_TYPE, default=DEVICE_TYPES[0]): vol.In(
+                    DEVICE_TYPES
+                ),
             }
         )
         return self.async_show_form(step_id="confirm", data_schema=schema)
@@ -104,7 +108,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Required(CONF_ADDRESS): str,
-                vol.Required(CONF_DEVICE_TYPE, default=DEVICE_TYPES[0]): vol.In(DEVICE_TYPES),
+                vol.Required(CONF_DEVICE_TYPE, default=DEVICE_TYPES[0]): vol.In(
+                    DEVICE_TYPES
+                ),
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)

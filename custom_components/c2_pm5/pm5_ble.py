@@ -59,6 +59,7 @@ _LOGGER = logging.getLogger(__name__)
 # https://cms.concept2.com/sites/default/files/2024-05/PM5_CSAFECommunicationDefinition_0.pdf
 # https://www.concept2.sg/files/pdf/us/monitors/PM5_CSAFECommunicationDefinition.pdf
 
+
 def c2_uuid(short: int) -> str:
     return BASE_UUID_FMT.format(short=short)
 
@@ -173,14 +174,17 @@ class PM5BleSession:
     def _in_cooldown(self) -> bool:
         if self._idle_disconnect_monotonic is None:
             return False
-        return time.monotonic() < (self._idle_disconnect_monotonic + IDLE_DISCONNECT_COOLDOWN_SECONDS)
+        return time.monotonic() < (
+            self._idle_disconnect_monotonic + IDLE_DISCONNECT_COOLDOWN_SECONDS
+        )
 
     def _cooldown_remaining(self) -> float:
         if self._idle_disconnect_monotonic is None:
             return 0.0
         return max(
             0.0,
-            (self._idle_disconnect_monotonic + IDLE_DISCONNECT_COOLDOWN_SECONDS) - time.monotonic(),
+            (self._idle_disconnect_monotonic + IDLE_DISCONNECT_COOLDOWN_SECONDS)
+            - time.monotonic(),
         )
 
     async def start(self) -> None:
@@ -273,7 +277,11 @@ class PM5BleSession:
                 await self._connect_and_listen()
                 backoff = 1
 
-            except (BleakOutOfConnectionSlotsError, BleakNotFoundError, BleakConnectionError):
+            except (
+                BleakOutOfConnectionSlotsError,
+                BleakNotFoundError,
+                BleakConnectionError,
+            ):
                 pass
 
             except PM5Unavailable as err:
@@ -293,12 +301,16 @@ class PM5BleSession:
                     await asyncio.gather(*pending, return_exceptions=True)
 
                     # Remove from cache so we only try to reconnect if it continues to advertise itself
-                    bluetooth.async_clear_address_from_match_history(self.hass, self.address)
+                    bluetooth.async_clear_address_from_match_history(
+                        self.hass, self.address
+                    )
                     self._last_seen_monotonic = None
                     self._set_available(False)
 
                 if not self._available:
-                    _LOGGER.info("Waiting for PM5 to become available (%s)", self.address)
+                    _LOGGER.info(
+                        "Waiting for PM5 to become available (%s)", self.address
+                    )
                     stop_task = asyncio.create_task(self._stop.wait())
                     avail_task = asyncio.create_task(self._available_event.wait())
                     done, pending = await asyncio.wait(
@@ -357,10 +369,14 @@ class PM5BleSession:
         _LOGGER.debug("CSAFE RX (%s): %s", self.address, frame.hex())
 
         try:
-            await self._client.write_gatt_char(self._uuid_csafe_rx, frame, response=False)
+            await self._client.write_gatt_char(
+                self._uuid_csafe_rx, frame, response=False
+            )
             return
         except Exception as err:
-            _LOGGER.debug("CSAFE write (response=False) failed; retrying response=True: %s", err)
+            _LOGGER.debug(
+                "CSAFE write (response=False) failed; retrying response=True: %s", err
+            )
 
         await self._client.write_gatt_char(self._uuid_csafe_rx, frame, response=True)
 
@@ -392,7 +408,9 @@ class PM5BleSession:
             return False
 
         now = time.monotonic()
-        if (now - self._last_terminate_attempt_monotonic) < TERMINATE_RATE_LIMIT_SECONDS:
+        if (
+            now - self._last_terminate_attempt_monotonic
+        ) < TERMINATE_RATE_LIMIT_SECONDS:
             return False
 
         if not self._workout_looks_active():
@@ -402,18 +420,24 @@ class PM5BleSession:
 
         async with self._csafe_lock:
             now = time.monotonic()
-            if (now - self._last_terminate_attempt_monotonic) < TERMINATE_RATE_LIMIT_SECONDS:
+            if (
+                now - self._last_terminate_attempt_monotonic
+            ) < TERMINATE_RATE_LIMIT_SECONDS:
                 return False
             if not self._workout_looks_active():
                 return False
 
             self._last_terminate_attempt_monotonic = now
             try:
-                _LOGGER.info("Attempting to terminate PM5 workout via CSAFE (%s)", self.address)
+                _LOGGER.info(
+                    "Attempting to terminate PM5 workout via CSAFE (%s)", self.address
+                )
                 await self._send_csafe_frame(frame)
                 return True
             except Exception as err:
-                _LOGGER.warning("Failed to send CSAFE terminate workout (%s): %s", self.address, err)
+                _LOGGER.warning(
+                    "Failed to send CSAFE terminate workout (%s): %s", self.address, err
+                )
                 return False
 
     # ---------- Date/time actions ----------
@@ -423,7 +447,9 @@ class PM5BleSession:
             return False
 
         now_m = time.monotonic()
-        if (now_m - self._last_datetime_sync_monotonic) < DATETIME_SYNC_RATE_LIMIT_SECONDS:
+        if (
+            now_m - self._last_datetime_sync_monotonic
+        ) < DATETIME_SYNC_RATE_LIMIT_SECONDS:
             return False
 
         # Proxy stacks can be touchy immediately after connect; let notifies settle.
@@ -436,19 +462,25 @@ class PM5BleSession:
         async with self._csafe_lock:
             # Re-check inside lock to avoid duplicate syncs on racing tasks
             now_m = time.monotonic()
-            if (now_m - self._last_datetime_sync_monotonic) < DATETIME_SYNC_RATE_LIMIT_SECONDS:
+            if (
+                now_m - self._last_datetime_sync_monotonic
+            ) < DATETIME_SYNC_RATE_LIMIT_SECONDS:
                 return False
 
             try:
                 _LOGGER.info("Syncing PM5 date/time via CSAFE (%s)", self.address)
-                await asyncio.wait_for(self._send_csafe_frame(frame), timeout=DATETIME_SYNC_TIMEOUT_SECONDS)
+                await asyncio.wait_for(
+                    self._send_csafe_frame(frame), timeout=DATETIME_SYNC_TIMEOUT_SECONDS
+                )
                 self._last_datetime_sync_monotonic = now_m
                 return True
             except asyncio.TimeoutError:
                 _LOGGER.warning("CSAFE date/time sync timed out (%s)", self.address)
                 return False
             except Exception as err:
-                _LOGGER.warning("CSAFE date/time sync failed (%s): %s", self.address, err)
+                _LOGGER.warning(
+                    "CSAFE date/time sync failed (%s): %s", self.address, err
+                )
                 return False
 
     async def _idle_watchdog(self, idle_event: asyncio.Event) -> None:
@@ -518,7 +550,9 @@ class PM5BleSession:
         try:
             await self._sync_datetime()
         except Exception:
-            _LOGGER.exception("Unexpected error during PM5 datetime sync (%s)", self.address)
+            _LOGGER.exception(
+                "Unexpected error during PM5 datetime sync (%s)", self.address
+            )
 
         disconnect_task = asyncio.create_task(disconnected.wait())
         idle_event_task = asyncio.create_task(idle_disconnect.wait())
@@ -609,11 +643,21 @@ class PM5BleSession:
                 {
                     "0031_elapsed_time_s": elapsed_time_s,
                     "0031_distance_m": distance_m,
-                    "0031_workout_type": WORKOUT_TYPE.get(workout_type_raw, f"Unknown ({workout_type_raw})"),
-                    "0031_interval_type": INTERVAL_TYPE.get(interval_type_raw, f"Unknown ({interval_type_raw})"),
-                    "0031_workout_state": WORKOUT_STATE.get(workout_state_raw, f"Unknown ({workout_state_raw})"),
-                    "0031_rowing_state": ROWING_STATE.get(rowing_state_raw, f"Unknown ({rowing_state_raw})"),
-                    "0031_stroke_state": STROKE_STATE.get(stroke_state_raw, f"Unknown ({stroke_state_raw})"),
+                    "0031_workout_type": WORKOUT_TYPE.get(
+                        workout_type_raw, f"Unknown ({workout_type_raw})"
+                    ),
+                    "0031_interval_type": INTERVAL_TYPE.get(
+                        interval_type_raw, f"Unknown ({interval_type_raw})"
+                    ),
+                    "0031_workout_state": WORKOUT_STATE.get(
+                        workout_state_raw, f"Unknown ({workout_state_raw})"
+                    ),
+                    "0031_rowing_state": ROWING_STATE.get(
+                        rowing_state_raw, f"Unknown ({rowing_state_raw})"
+                    ),
+                    "0031_stroke_state": STROKE_STATE.get(
+                        stroke_state_raw, f"Unknown ({stroke_state_raw})"
+                    ),
                 }
             )
         )
@@ -647,7 +691,9 @@ class PM5BleSession:
                     "0032_average_pace_s_per_500m": average_pace_s_per_500m,
                     "0032_rest_distance_m": rest_distance_m,
                     "0032_rest_time_s": rest_time_s,
-                    "0032_erg_machine_type": ERG_MACHINE_TYPE.get(erg_type_raw, f"Unknown ({erg_type_raw})"),
+                    "0032_erg_machine_type": ERG_MACHINE_TYPE.get(
+                        erg_type_raw, f"Unknown ({erg_type_raw})"
+                    ),
                 }
             )
         )
@@ -708,21 +754,31 @@ class PM5BleSession:
         workout_type_raw = b[17]
         avg_pace_s_per_500m = u16_le(b, 18) / 10.0
 
-        self.on_data(PM5Data({
-            "0039_log_entry_date": log_date,
-            "0039_log_entry_time": log_time,
-            "0039_elapsed_time_s": elapsed_s,
-            "0039_distance_m": distance_m,
-            "0039_avg_stroke_rate_spm": avg_stroke_rate,
-            "0039_ending_heart_rate_bpm": None if ending_hr in (0, 255) else ending_hr,
-            "0039_avg_heart_rate_bpm": None if avg_hr in (0, 255) else avg_hr,
-            "0039_min_heart_rate_bpm": None if min_hr in (0, 255) else min_hr,
-            "0039_max_heart_rate_bpm": None if max_hr in (0, 255) else max_hr,
-            "0039_drag_factor_avg": drag_avg,
-            "0039_recovery_heart_rate_bpm": None if recovery_hr in (0, 255) else recovery_hr,
-            "0039_workout_type": WORKOUT_TYPE.get(workout_type_raw, f"Unknown ({workout_type_raw})"),
-            "0039_avg_pace_s_per_500m": avg_pace_s_per_500m,
-        }))
+        self.on_data(
+            PM5Data(
+                {
+                    "0039_log_entry_date": log_date,
+                    "0039_log_entry_time": log_time,
+                    "0039_elapsed_time_s": elapsed_s,
+                    "0039_distance_m": distance_m,
+                    "0039_avg_stroke_rate_spm": avg_stroke_rate,
+                    "0039_ending_heart_rate_bpm": (
+                        None if ending_hr in (0, 255) else ending_hr
+                    ),
+                    "0039_avg_heart_rate_bpm": None if avg_hr in (0, 255) else avg_hr,
+                    "0039_min_heart_rate_bpm": None if min_hr in (0, 255) else min_hr,
+                    "0039_max_heart_rate_bpm": None if max_hr in (0, 255) else max_hr,
+                    "0039_drag_factor_avg": drag_avg,
+                    "0039_recovery_heart_rate_bpm": (
+                        None if recovery_hr in (0, 255) else recovery_hr
+                    ),
+                    "0039_workout_type": WORKOUT_TYPE.get(
+                        workout_type_raw, f"Unknown ({workout_type_raw})"
+                    ),
+                    "0039_avg_pace_s_per_500m": avg_pace_s_per_500m,
+                }
+            )
+        )
 
     # 0x003A (19 bytes) End-of-workout additional summary
     def _handle_003A(self, _uuid: str, data: bytearray) -> None:
@@ -743,17 +799,21 @@ class PM5BleSession:
         interval_rest_time_s = u16_le(b, 15)
         avg_calories_per_hr = u16_le(b, 17)
 
-        self.on_data(PM5Data({
-            "003a_log_entry_date": log_date,
-            "003a_log_entry_time": log_time,
-            "003a_split_interval_type": INTERVAL_TYPE.get(
-                split_interval_type_raw, f"Unknown ({split_interval_type_raw})"
-            ),
-            "003a_split_interval_size": split_interval_size,
-            "003a_split_interval_count": split_interval_count,
-            "003a_total_calories": total_calories,
-            "003a_avg_power_w": avg_power_w,
-            "003a_total_rest_distance_m": total_rest_distance_m,
-            "003a_interval_rest_time_s": interval_rest_time_s,
-            "003a_avg_calories_per_hr": avg_calories_per_hr,
-        }))
+        self.on_data(
+            PM5Data(
+                {
+                    "003a_log_entry_date": log_date,
+                    "003a_log_entry_time": log_time,
+                    "003a_split_interval_type": INTERVAL_TYPE.get(
+                        split_interval_type_raw, f"Unknown ({split_interval_type_raw})"
+                    ),
+                    "003a_split_interval_size": split_interval_size,
+                    "003a_split_interval_count": split_interval_count,
+                    "003a_total_calories": total_calories,
+                    "003a_avg_power_w": avg_power_w,
+                    "003a_total_rest_distance_m": total_rest_distance_m,
+                    "003a_interval_rest_time_s": interval_rest_time_s,
+                    "003a_avg_calories_per_hr": avg_calories_per_hr,
+                }
+            )
+        )
