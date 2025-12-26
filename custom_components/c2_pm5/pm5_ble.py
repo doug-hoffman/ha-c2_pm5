@@ -209,10 +209,12 @@ class PM5BleSession:
 
         if self._avail_task:
             self._avail_task.cancel()
+            await asyncio.gather(self._avail_task, return_exceptions=True)
             self._avail_task = None
 
         if self._task:
             await self._task
+            self._task = None
 
         self._set_available(False)
         self._set_connected(False)
@@ -527,83 +529,89 @@ class PM5BleSession:
             max_attempts=2,
         )
 
-        # Reset idle tracking on connect
-        self._last_active_monotonic = time.monotonic()
-        self._idle_disconnect_monotonic = None
-        self._workout_state_raw = None
-
-        await self._client.start_notify(self._uuid31, self._handle_0031)
-        await self._client.start_notify(self._uuid32, self._handle_0032)
-        await self._client.start_notify(self._uuid33, self._handle_0033)
-        await self._client.start_notify(self._uuid39, self._handle_0039)
-        await self._client.start_notify(self._uuid3a, self._handle_003A)
-
-        # Optional: subscribe to CSAFE TX notifications (responses), if supported
         try:
-            await self._client.start_notify(self._uuid_csafe_tx, self._handle_csafe_tx)
-        except Exception as err:
-            _LOGGER.debug("CSAFE TX notify not available (%s): %s", self.address, err)
+            # Reset idle tracking on connect
+            self._last_active_monotonic = time.monotonic()
+            self._idle_disconnect_monotonic = None
+            self._workout_state_raw = None
 
-        _LOGGER.info("Connected to PM5 (%s)", self.address)
-        self._set_connected(True)
+            await self._client.start_notify(self._uuid31, self._handle_0031)
+            await self._client.start_notify(self._uuid32, self._handle_0032)
+            await self._client.start_notify(self._uuid33, self._handle_0033)
+            await self._client.start_notify(self._uuid39, self._handle_0039)
+            await self._client.start_notify(self._uuid3a, self._handle_003A)
 
-        try:
-            await self._sync_datetime()
-        except Exception:
-            _LOGGER.exception(
-                "Unexpected error during PM5 datetime sync (%s)", self.address
+            # Optional: subscribe to CSAFE TX notifications (responses), if supported
+            try:
+                await self._client.start_notify(self._uuid_csafe_tx, self._handle_csafe_tx)
+            except Exception as err:
+                _LOGGER.debug("CSAFE TX notify not available (%s): %s", self.address, err)
+
+            _LOGGER.info("Connected to PM5 (%s)", self.address)
+            self._set_connected(True)
+
+            try:
+                await self._sync_datetime()
+            except Exception:
+                _LOGGER.exception(
+                    "Unexpected error during PM5 datetime sync (%s)", self.address
+                )
+
+            disconnect_task = asyncio.create_task(disconnected.wait())
+            idle_event_task = asyncio.create_task(idle_disconnect.wait())
+            idle_task = asyncio.create_task(self._idle_watchdog(idle_disconnect))
+            stop_task = asyncio.create_task(self._stop.wait())
+
+            done, pending = await asyncio.wait(
+                {disconnect_task, idle_event_task, idle_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
 
-        disconnect_task = asyncio.create_task(disconnected.wait())
-        idle_event_task = asyncio.create_task(idle_disconnect.wait())
-        idle_task = asyncio.create_task(self._idle_watchdog(idle_disconnect))
-        stop_task = asyncio.create_task(self._stop.wait())
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
-        done, pending = await asyncio.wait(
-            {disconnect_task, idle_event_task, idle_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+            if idle_disconnect.is_set() and not self._stop.is_set():
+                _LOGGER.warning(
+                    "PM5 idle for %d minutes; disconnecting to allow sleep (%s)",
+                    IDLE_DISCONNECT_SECONDS // 60,
+                    self.address,
+                )
 
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+                # Try to terminate workout first
+                try:
+                    await self._terminate_workout()
+                except Exception:
+                    _LOGGER.exception(
+                        "Unexpected error during PM5 workout termination (%s)", self.address
+                    )
 
-        if idle_disconnect.is_set() and not self._stop.is_set():
-            _LOGGER.warning(
-                "PM5 idle for %d minutes; disconnecting to allow sleep (%s)",
-                IDLE_DISCONNECT_SECONDS // 60,
-                self.address,
-            )
+                # Give PM a moment to emit end-of-workout summaries (0039/003A)
+                if not self._stop.is_set():
+                    await asyncio.sleep(TERMINATE_GRACE_SECONDS)
 
-            # Try to terminate workout first
-            await self._terminate_workout()
+                self._idle_disconnect_monotonic = time.monotonic()
 
-            # Give PM a moment to emit end-of-workout summaries (0039/003A)
-            if not self._stop.is_set():
-                await asyncio.sleep(TERMINATE_GRACE_SECONDS)
+        finally:
+            _LOGGER.info("PM5 disconnected (%s)", self.address)
+            self._set_connected(False)
 
-            self._idle_disconnect_monotonic = time.monotonic()
+            client = self._client
+            self._client = None  # break reference cycles ASAP
 
-        _LOGGER.info("PM5 disconnected (%s)", self.address)
-
-        try:
-            await self._client.stop_notify(self._uuid31)
-            await self._client.stop_notify(self._uuid32)
-            await self._client.stop_notify(self._uuid33)
-            await self._client.stop_notify(self._uuid39)
-            await self._client.stop_notify(self._uuid3a)
-        except Exception:
-            pass
-
-        try:
-            await self._client.stop_notify(self._uuid_csafe_tx)
-        except Exception:
-            pass
-
-        try:
-            await self._client.disconnect()
-        except Exception:
-            pass
+            if client is not None:
+                # Best-effort notify stop
+                for uuid in (
+                    self._uuid31, self._uuid32, self._uuid33, self._uuid39, self._uuid3a, self._uuid_csafe_tx
+                ):
+                    try:
+                        await client.stop_notify(uuid)
+                    except Exception:
+                        pass
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
     # ---------- Notification Parsers ----------
     def _bump_seen(self) -> None:
