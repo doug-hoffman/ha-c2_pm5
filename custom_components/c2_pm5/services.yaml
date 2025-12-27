@@ -1,0 +1,35 @@
+connect_hrm:
+  name: Connect HRM
+  description: Connect to a PM5 heart rate monitor.
+  fields:
+    address:
+      name: Device MAC
+      description: PM5 Bluetooth MAC address (AA:BB:CC:DD:EE:FF)
+      required: true
+      selector:
+        text:
+    manufacturer_id:
+      name: Manufacturer ID
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    device_type:
+      name: Device Type
+      required: true
+      selector:
+        select:
+          options:
+            - Bluetooth
+            - ANT+
+    belt_id:
+      name: Belt ID
+      description: 32-bit belt ID (integer)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 4294967295
+          mode: box

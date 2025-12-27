@@ -22,16 +22,31 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     BASE_UUID_FMT,
+    BATTERY_POLL_SECONDS,
     CHAR_0031,
     CHAR_0032,
     CHAR_0033,
+    CHAR_0035,
+    CHAR_0036,
+    CHAR_0037,
+    CHAR_0038,
     CHAR_0039,
     CHAR_003A,
+    CHAR_0080,
     CHAR_CSAFE_RX,
     CHAR_CSAFE_TX,
-    CSAFE_COMMAND_WRAPPER,
+    CSAFE_COMMAND_WRAPPER_NONE,
+    CSAFE_COMMAND_WRAPPER_GETPMCFG,
+    CSAFE_COMMAND_WRAPPER_GETPMDATA,
+    CSAFE_COMMAND_WRAPPER_SETPMCFG,
+    CSAFE_COMMAND_WRAPPER_SETPMDATA,
     CSAFE_EXT_START,
+    CSAFE_PM_GET_BATTERYLEVELPERCENT,
+    CSAFE_PM_GET_EXTENDED_HRBELT_INFO,
     CSAFE_PM_SET_DATETIME,
+    CSAFE_PM_SET_EXTENDED_HRBELT_INFO,
+    CSAFE_PM_TERMINATE_WORKOUT_CONTENTS,
+    CSAFE_REQUEST_TIMEOUT_SECONDS,
     CSAFE_STD_START,
     CSAFE_STOP,
     CSAFE_STUFF,
@@ -40,7 +55,8 @@ from .const import (
     DATETIME_SYNC_TIMEOUT_SECONDS,
     DEVICE_STALE_SECONDS,
     ERG_MACHINE_TYPE,
-    GET_DATETIME_CONTENTS,
+    HRM_DEVICE_TYPE,
+    HRM_POLL_SECONDS,
     IDLE_DISCONNECT_COOLDOWN_SECONDS,
     IDLE_DISCONNECT_SECONDS,
     INTERVAL_TYPE,
@@ -48,7 +64,6 @@ from .const import (
     STROKE_STATE,
     TERMINATE_GRACE_SECONDS,
     TERMINATE_RATE_LIMIT_SECONDS,
-    TERMINATE_WORKOUT_CONTENTS,
     WORKOUT_DURATION_TYPE,
     WORKOUT_STATE,
     WORKOUT_TYPE,
@@ -104,6 +119,35 @@ def csafe_byte_stuff(payload: bytes) -> bytes:
     return bytes(out)
 
 
+def csafe_byte_unstuff(payload: bytes) -> bytes:
+    """Reverse of csafe_byte_stuff()."""
+    out = bytearray()
+    i = 0
+    n = len(payload)
+    while i < n:
+        b = payload[i]
+        if b != CSAFE_STUFF:
+            out.append(b)
+            i += 1
+            continue
+        # Stuff byte must be followed by selector 00..03
+        if i + 1 >= n:
+            raise ValueError("CSAFE unstuff: truncated escape sequence")
+        sel = payload[i + 1]
+        if sel == 0x00:
+            out.append(CSAFE_EXT_START)
+        elif sel == 0x01:
+            out.append(CSAFE_STD_START)
+        elif sel == 0x02:
+            out.append(CSAFE_STOP)
+        elif sel == 0x03:
+            out.append(CSAFE_STUFF)
+        else:
+            raise ValueError(f"CSAFE unstuff: invalid selector 0x{sel:02x}")
+        i += 2
+    return bytes(out)
+
+
 def build_csafe_standard_frame(frame_contents: bytes) -> bytes:
     """
     Build a CSAFE *standard* frame:
@@ -112,6 +156,14 @@ def build_csafe_standard_frame(frame_contents: bytes) -> bytes:
     checksum = csafe_xor_checksum(frame_contents)
     stuffed = csafe_byte_stuff(frame_contents + bytes([checksum]))
     return bytes([CSAFE_STD_START]) + stuffed + bytes([CSAFE_STOP])
+
+
+def try_lookup(address: str, name: str, data: dict, key: str):
+    try:
+        return data[key]
+    except KeyError:
+        _LOGGER.debug("Attempted to lookup unknown %s (%s): %i", name, address, key)
+        return None
 
 
 @dataclass
@@ -146,8 +198,13 @@ class PM5BleSession:
         self._uuid31 = c2_uuid(CHAR_0031)
         self._uuid32 = c2_uuid(CHAR_0032)
         self._uuid33 = c2_uuid(CHAR_0033)
+        self._uuid35 = c2_uuid(CHAR_0035)
+        self._uuid36 = c2_uuid(CHAR_0036)
+        self._uuid37 = c2_uuid(CHAR_0037)
+        self._uuid38 = c2_uuid(CHAR_0038)
         self._uuid39 = c2_uuid(CHAR_0039)
         self._uuid3a = c2_uuid(CHAR_003A)
+        self._uuid80 = c2_uuid(CHAR_0080)
 
         # CSAFE control characteristics
         self._uuid_csafe_rx = c2_uuid(CHAR_CSAFE_RX)  # write to PM
@@ -155,6 +212,7 @@ class PM5BleSession:
 
         # CSAFE send guards
         self._csafe_lock = asyncio.Lock()
+        self._pending_csafe: dict[int, asyncio.Future[bytes]] = {}
         self._last_terminate_attempt_monotonic: float = 0.0
         self._last_datetime_sync_monotonic: float = 0.0
 
@@ -359,6 +417,76 @@ class PM5BleSession:
 
     # ---------- CSAFE ----------
 
+    def _cancel_pending_csafe(self) -> None:
+        if not self._pending_csafe:
+            return
+        for fut in self._pending_csafe.values():
+            if not fut.done():
+                fut.cancel()
+        self._pending_csafe.clear()
+
+    def _parse_csafe_standard_frame(self, raw: bytes) -> bytes:
+        """
+        Parse a CSAFE standard frame from raw TX notify data.
+        Returns *frame contents* (no checksum).
+        """
+        if not raw:
+            raise ValueError("Empty CSAFE TX payload")
+
+        # Some stacks may deliver multiple frames or partials; PM5 BLE TX typically sends single frames.
+        if raw[0] != CSAFE_STD_START or raw[-1] != CSAFE_STOP:
+            raise ValueError(f"Not a CSAFE standard frame: {raw.hex()}")
+
+        stuffed = raw[1:-1]
+        unstuffed = csafe_byte_unstuff(stuffed)
+        if len(unstuffed) < 2:
+            raise ValueError("CSAFE frame too short after unstuff")
+
+        contents = unstuffed[:-1]
+        checksum = unstuffed[-1]
+        if csafe_xor_checksum(contents) != checksum:
+            raise ValueError("CSAFE checksum mismatch")
+
+        return contents
+
+    def _consume_csafe_responses(self, contents: bytes) -> None:
+        """
+        Contents format in spec examples: [STATUS, <responses...>]
+        Response format is typically: [CMD, RESPONSE_BYTE_COUNT, <DATA...>]
+        Some responses may omit the count when 0; we handle both defensively.
+        """
+        if not contents:
+            return
+
+        status = contents[0]
+        payload = contents[2:]
+
+        if (status & 0xF0) not in (0x00, 0x80):
+            _LOGGER.debug(
+                "CSAFE TX status indicates error (0x%02x): %s", status, contents.hex()
+            )
+
+        i = 0
+        while i < len(payload):
+            cmd = payload[i]
+            # If we can’t read a length byte, treat as zero-length response.
+            if i + 1 >= len(payload):
+                resp = bytes([cmd])
+                i += 1
+            else:
+                resp_len = payload[i + 1]
+                # If resp_len is nonsensical, fall back to “no-len” interpretation
+                if i + 2 + resp_len <= len(payload):
+                    resp = payload[i : i + 2 + resp_len]
+                    i += 2 + resp_len
+                else:
+                    resp = bytes([cmd])
+                    i += 1
+
+            fut = self._pending_csafe.get(cmd)
+            if fut is not None and not fut.done():
+                fut.set_result(resp)
+
     async def _send_csafe_frame(self, frame: bytes) -> None:
         """
         Write CSAFE frame to PM (0x0021).
@@ -383,26 +511,198 @@ class PM5BleSession:
 
         await self._client.write_gatt_char(self._uuid_csafe_rx, frame, response=True)
 
-    def _build_set_datetime_contents(self) -> bytes:
-        # Use HA's configured timezone (dt_util.now() is timezone-aware and respects HA config)
-        now = dt_util.now()
+    async def _csafe_request(self, wrapper: int, cmd: int, data: bytes = b"") -> bytes:
+        """
+        Send a CSAFE command and await the corresponding response from CSAFE TX.
+        Correlates by command byte.
 
-        if (now.second + now.microsecond / 1e6) >= 30:
-            # Round up so we're accurate witin 30 seconds
-            now += timedelta(minutes=1)
+        Returns the response chunk: [CMD, RESPONSE_LEN?, DATA...]
+        """
+        if not self._client:
+            raise PM5Unavailable("No BLE client")
 
-        y1 = now.year >> 8
-        y2 = now.year & 0xFF
-        mo = now.month
-        dd = now.day
-        hh = int(now.strftime("%I"))
-        mi = now.minute
-        xm = 0 if now.strftime("%p").lower() == "am" else 1
+        if cmd >= 0x00 and cmd <= 0x7F and data == b"":
+            raise ValueError("No data passed for long command")
 
-        cmd = CSAFE_PM_SET_DATETIME
-        data = bytes([hh, mi, xm, mo, dd, y1, y2])
-        length = 2 + len(data)  # cmd + len(data) + data
-        return bytes([CSAFE_COMMAND_WRAPPER, length, cmd, len(data)]) + data
+        if cmd >= 0x80 and cmd <= 0xFF and data != b"":
+            raise ValueError("Data passed for short command")
+
+        async with self._csafe_lock:
+            # One in-flight request per command
+            prev = self._pending_csafe.get(cmd)
+            if prev is not None and not prev.done():
+                prev.cancel()
+
+            fut: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+            self._pending_csafe[cmd] = fut
+
+            # Build contents (standard CSAFE behavior):
+            # - no-arg “short get”: just [CMD]
+            # - arg commands: [CMD, CMD_BYTE_COUNT, <DATA...>]
+            if data:
+                if wrapper != CSAFE_COMMAND_WRAPPER_NONE:
+                    length = 2 + len(data)  # cmd + len(data) + data
+                    contents = bytes([wrapper, length, cmd, len(data)]) + data
+                else:
+                    contents = bytes([cmd, len(data)]) + data
+            else:
+                if wrapper != CSAFE_COMMAND_WRAPPER_NONE:
+                    contents = bytes([wrapper, 1, cmd])
+                else:
+                    contents = bytes([cmd])
+
+            frame = build_csafe_standard_frame(contents)
+
+            await self._send_csafe_frame(frame)
+
+            try:
+                resp = await asyncio.wait_for(
+                    fut, timeout=CSAFE_REQUEST_TIMEOUT_SECONDS
+                )
+                return resp
+            finally:
+                # Keep dict clean
+                cur = self._pending_csafe.get(cmd)
+                if cur is fut:
+                    self._pending_csafe.pop(cmd, None)
+
+    # ---------- Heartrate monitor ----------
+    async def poll_hrbelt_info_once(self) -> None:
+        """
+        Poll CSAFE_PM_GET_EXTENDED_HRBELT_INFO (0x57).
+        Response bytes:
+          Byte0: user number (0-4)
+          Byte1: manufacturer id
+          Byte2: device type
+          Byte3-6: belt id (32-bit)
+        """
+        try:
+            resp = await self._csafe_request(
+                CSAFE_COMMAND_WRAPPER_GETPMDATA,
+                CSAFE_PM_GET_EXTENDED_HRBELT_INFO,
+                data=b"\x00",
+            )
+        except Exception as err:
+            _LOGGER.debug("HRM poll failed (%s): %s", self.address, err)
+            return
+
+        if len(resp) < 9:
+            _LOGGER.debug("Received unexpected length hrbelt_info response: %s", resp)
+            return
+
+        if resp[0] != CSAFE_PM_GET_EXTENDED_HRBELT_INFO:
+            return
+
+        data_len = resp[1]
+        data = resp[2 : 2 + data_len]
+
+        if data_len < 7:
+            _LOGGER.debug(
+                "Received unexpected length hrbelt_info data response: %s", resp
+            )
+            return
+
+        user_id = data[0]
+
+        manufacturer_id = data[1]
+        device_type_raw = data[2]
+        belt_id = int.from_bytes(data[3:7], byteorder="little", signed=False)
+
+        if belt_id == 0:
+            manufacturer_id = None
+            device_type_raw = None
+            belt_id = None
+
+        self.on_data(
+            PM5Data(
+                {
+                    "user_id": user_id,
+                    "hrm_manufacturer_id": manufacturer_id,
+                    "hrm_device_type": (
+                        None
+                        if belt_id is None
+                        else HRM_DEVICE_TYPE.get(
+                            device_type_raw, f"Unknown ({device_type_raw})"
+                        )
+                    ),
+                    "hrm_belt_id": belt_id,
+                }
+            )
+        )
+
+    async def async_set_hrbelt_info(
+        self, manufacturer_id: int, device_type: int | str, belt_id: int
+    ) -> None:
+        """
+        Set CSAFE_PM_SET_EXTENDED_HRBELT_INFO (0x39).
+        Payload: [unused, manufacturer_id, device_type, belt_id(4 bytes)]
+        """
+        user_number = 0
+        manufacturer_id = int(manufacturer_id)
+        device_type_final = None
+        try:
+            device_type_final = int(device_type)
+        except ValueError:
+            pass
+
+        try:
+            device_type_map = dict((v.lower(), k) for k, v in HRM_DEVICE_TYPE.items())
+            device_type_final = device_type_map.get(device_type.lower())
+        except (AttributeError, KeyError):
+            pass
+
+        belt_id = int(belt_id)
+
+        if user_number < 0 or user_number > 4:
+            raise ValueError("user_number must be 0..4")
+
+        if manufacturer_id < 0 or manufacturer_id > 255:
+            raise ValueError(f"manufacturer_id must be 0..255")
+
+        if device_type_final < 0 or device_type_final > 1:
+            raise ValueError(f"device_type must be 0..1")
+
+        if belt_id < 0 or belt_id > 0xFFFFFFFF:
+            raise ValueError("belt_id must fit in 32-bit unsigned")
+
+        data = bytes(
+            [user_number, manufacturer_id, device_type_final]
+        ) + belt_id.to_bytes(4, byteorder="little", signed=False)
+
+        # For set commands, we still await the “echo” response so HA service can report failure quickly.
+        await self._csafe_request(
+            CSAFE_COMMAND_WRAPPER_SETPMDATA,
+            CSAFE_PM_SET_EXTENDED_HRBELT_INFO,
+            data=data,
+        )
+
+    # ---------- Battery ----------
+    async def poll_battery_once(self) -> None:
+        """
+        Poll CSAFE_PM_GET_BATTERYLEVELPERCENT (0x97).
+        Response: one byte percent.
+        """
+        try:
+            resp = await self._csafe_request(
+                CSAFE_COMMAND_WRAPPER_GETPMDATA, CSAFE_PM_GET_BATTERYLEVELPERCENT
+            )
+        except Exception as err:
+            _LOGGER.debug("Battery poll failed (%s): %s", self.address, err)
+            return
+
+        if len(resp) < 3:
+            _LOGGER.debug("Received unexpected length battery response: %s", resp)
+            return
+
+        if resp[0] != CSAFE_PM_GET_BATTERYLEVELPERCENT:
+            _LOGGER.debug("Received invalid battery response: %s", resp)
+            return
+
+        pct = resp[2]
+        if pct < 0 or pct > 100:
+            return
+
+        self.on_data(PM5Data({"battery_level_percent": pct}))
 
     # ---------- Workout actions ----------
     async def _terminate_workout(self) -> bool:
@@ -419,7 +719,7 @@ class PM5BleSession:
         if not self._workout_looks_active():
             return False
 
-        frame = build_csafe_standard_frame(TERMINATE_WORKOUT_CONTENTS)
+        frame = build_csafe_standard_frame(CSAFE_PM_TERMINATE_WORKOUT_CONTENTS)
 
         async with self._csafe_lock:
             now = time.monotonic()
@@ -444,6 +744,27 @@ class PM5BleSession:
                 return False
 
     # ---------- Date/time actions ----------
+    def _build_set_datetime_contents(self) -> bytes:
+        # Use HA's configured timezone (dt_util.now() is timezone-aware and respects HA config)
+        now = dt_util.now()
+
+        if (now.second + now.microsecond / 1e6) >= 30:
+            # Round up so we're accurate witin 30 seconds
+            now += timedelta(minutes=1)
+
+        y1 = now.year >> 8
+        y2 = now.year & 0xFF
+        mo = now.month
+        dd = now.day
+        hh = int(now.strftime("%I"))
+        mi = now.minute
+        xm = 0 if now.strftime("%p").lower() == "am" else 1
+
+        cmd = CSAFE_PM_SET_DATETIME
+        data = bytes([hh, mi, xm, mo, dd, y1, y2])
+        length = 2 + len(data)  # cmd + len(data) + data
+        return bytes([CSAFE_COMMAND_WRAPPER_SETPMCFG, length, cmd, len(data)]) + data
+
     async def _sync_datetime(self) -> bool:
         """Sync PM5 date/time using CSAFE_PM_SET_DATETIME (0x22)."""
         if not self._client:
@@ -486,6 +807,21 @@ class PM5BleSession:
                 )
                 return False
 
+    # ---------- Pollers ----------
+    async def _poll_loop(self, *, initial_delay: float, interval: float, fn) -> None:
+        try:
+            await asyncio.sleep(initial_delay)
+            while (
+                not self._stop.is_set() and self._connected and self._client is not None
+            ):
+                await fn()
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+        except Exception as err:
+            _LOGGER.debug("Poll loop crashed (%s): %s", self.address, err)
+
+    # ---------- Idle watchdog ----------
     async def _idle_watchdog(self, idle_event: asyncio.Event) -> None:
         try:
             while not self._stop.is_set():
@@ -536,21 +872,12 @@ class PM5BleSession:
             self._idle_disconnect_monotonic = None
             self._workout_state_raw = None
 
-            await self._client.start_notify(self._uuid31, self._handle_0031)
-            await self._client.start_notify(self._uuid32, self._handle_0032)
             await self._client.start_notify(self._uuid33, self._handle_0033)
+            await self._client.start_notify(self._uuid35, self._handle_0035)
             await self._client.start_notify(self._uuid39, self._handle_0039)
             await self._client.start_notify(self._uuid3a, self._handle_003A)
-
-            # Optional: subscribe to CSAFE TX notifications (responses), if supported
-            try:
-                await self._client.start_notify(
-                    self._uuid_csafe_tx, self._handle_csafe_tx
-                )
-            except Exception as err:
-                _LOGGER.debug(
-                    "CSAFE TX notify not available (%s): %s", self.address, err
-                )
+            await self._client.start_notify(self._uuid80, self._handle_0080)
+            await self._client.start_notify(self._uuid_csafe_tx, self._handle_csafe_tx)
 
             _LOGGER.info("Connected to PM5 (%s)", self.address)
             self._set_connected(True)
@@ -566,9 +893,30 @@ class PM5BleSession:
             idle_event_task = asyncio.create_task(idle_disconnect.wait())
             idle_task = asyncio.create_task(self._idle_watchdog(idle_disconnect))
             stop_task = asyncio.create_task(self._stop.wait())
+            poll_hrm_task = asyncio.create_task(
+                self._poll_loop(
+                    initial_delay=0.0,
+                    interval=HRM_POLL_SECONDS,
+                    fn=self.poll_hrbelt_info_once,
+                )
+            )
+            poll_battery_task = asyncio.create_task(
+                self._poll_loop(
+                    initial_delay=2.0,
+                    interval=BATTERY_POLL_SECONDS,
+                    fn=self.poll_battery_once,
+                )
+            )
 
             done, pending = await asyncio.wait(
-                {disconnect_task, idle_event_task, idle_task, stop_task},
+                {
+                    disconnect_task,
+                    idle_event_task,
+                    idle_task,
+                    stop_task,
+                    poll_hrm_task,
+                    poll_battery_task,
+                },
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -602,17 +950,19 @@ class PM5BleSession:
             _LOGGER.info("PM5 disconnected (%s)", self.address)
             self._set_connected(False)
 
+            self._cancel_pending_csafe()
+
             client = self._client
             self._client = None  # break reference cycles ASAP
 
             if client is not None:
                 # Best-effort notify stop
                 for uuid in (
-                    self._uuid31,
-                    self._uuid32,
                     self._uuid33,
+                    self._uuid35,
                     self._uuid39,
                     self._uuid3a,
+                    self._uuid80,
                     self._uuid_csafe_tx,
                 ):
                     try:
@@ -630,28 +980,88 @@ class PM5BleSession:
         self._set_available(True)
 
     def _handle_csafe_tx(self, _uuid: str, data: bytearray) -> None:
-        """Optional CSAFE TX notifications from PM (0x0022)."""
+        """CSAFE TX notifications from PM (0x0022)."""
         self._bump_seen()
-        _LOGGER.debug("CSAFE TX (%s): %s", self.address, bytes(data).hex())
+        raw = bytes(data)
+        _LOGGER.debug("CSAFE TX (%s): %s", self.address, raw.hex())
+
+        try:
+            contents = self._parse_csafe_standard_frame(raw)
+            self._consume_csafe_responses(contents)
+        except Exception as err:
+            # Don’t spam logs; this can happen if proxy delivers partials/concats
+            _LOGGER.debug("CSAFE TX parse error (%s): %s", self.address, err)
+
+    # 0x0080 (variable) Multiplexed information
+    def _handle_0080(self, _uuid: str, data: bytearray) -> None:
+        cmd = data[0]
+        match cmd:
+            case 0x31:
+                self._handle_0031(_uuid, data[1:])
+            case 0x32:
+                self._handle_0032(_uuid, data[1:])
+            case 0x33:
+                self._handle_0033(_uuid, data[1:])
+            case 0x35:
+                self._handle_0035(_uuid, data[1:])
+            case 0x36:
+                self._handle_0036(_uuid, data[1:])
+            case 0x37:
+                self._handle_0037(_uuid, data[1:])
+            case 0x38:
+                self._handle_0038(_uuid, data[1:])
+            case 0x39:
+                self._handle_0039(_uuid, data[1:])
+            case 0x3A:
+                self._handle_003A(_uuid, data[1:])
+            case _:
+                _LOGGER.debug(
+                    "Received unhandled multiplex command (%s): %s -> %s",
+                    self.address,
+                    hex(cmd),
+                    data[1:].hex(),
+                )
 
     # 0x0031 (19 bytes) Rowing general status
     def _handle_0031(self, _uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) < 19:
+        if len(b) != 19 and _uuid in (self._uuid31, self._uuid80):
+            _LOGGER.debug("Received unexpected length 0x0031 notify: %s", b.hex())
             return
 
         elapsed_time_s = u24_le(b, 0) / 100.0
         distance_m = u24_le(b, 3) / 10.0
         workout_type_raw = b[6]
+        workout_type = try_lookup(
+            self.address, "workout type", WORKOUT_TYPE, workout_type_raw
+        )
         interval_type_raw = b[7]
+        interval_type = try_lookup(
+            self.address, "interval type", INTERVAL_TYPE, interval_type_raw
+        )
         workout_state_raw = b[8]
+        workout_state = try_lookup(
+            self.address, "workout state", WORKOUT_STATE, workout_state_raw
+        )
         rowing_state_raw = b[9]
+        rowing_state = try_lookup(
+            self.address, "rowing state", ROWING_STATE, rowing_state_raw
+        )
         stroke_state_raw = b[10]
+        stroke_state = try_lookup(
+            self.address, "stroke state", STROKE_STATE, stroke_state_raw
+        )
         total_work_distance_m = u24_le(b, 11)
         workout_duration = u24_le(b, 14)
         workout_duration_type_raw = b[17]
+        workout_duration_type = try_lookup(
+            self.address,
+            "workout duration type",
+            WORKOUT_DURATION_TYPE,
+            workout_duration_type_raw,
+        )
         drag_factor = b[18]
 
         # Track workout state for terminate gating
@@ -666,42 +1076,33 @@ class PM5BleSession:
                 {
                     "0031_elapsed_time_s": elapsed_time_s,
                     "0031_distance_m": distance_m,
-                    "0031_workout_type": WORKOUT_TYPE.get(
-                        workout_type_raw, f"Unknown ({workout_type_raw})"
-                    ),
-                    "0031_interval_type": INTERVAL_TYPE.get(
-                        interval_type_raw, f"Unknown ({interval_type_raw})"
-                    ),
-                    "0031_workout_state": WORKOUT_STATE.get(
-                        workout_state_raw, f"Unknown ({workout_state_raw})"
-                    ),
-                    "0031_rowing_state": ROWING_STATE.get(
-                        rowing_state_raw, f"Unknown ({rowing_state_raw})"
-                    ),
-                    "0031_stroke_state": STROKE_STATE.get(
-                        stroke_state_raw, f"Unknown ({stroke_state_raw})"
-                    ),
+                    "0031_workout_type": workout_type,
+                    "0031_interval_type": interval_type,
+                    "0031_workout_state": workout_state,
+                    "0031_rowing_state": rowing_state,
+                    "0031_stroke_state": stroke_state,
                     "0031_total_work_distance_m": total_work_distance_m,
                     "0031_workout_duration": (
                         workout_duration
                         if workout_duration_type_raw != 0
                         else (workout_duration / 100)
                     ),
-                    "0031_workout_duration_type": WORKOUT_DURATION_TYPE.get(
-                        workout_duration_type_raw,
-                        f"Unknown ({workout_duration_type_raw})",
-                    ),
+                    "0031_workout_duration_type": workout_duration_type,
                     "0031_drag_factor": drag_factor,
                 }
             )
         )
 
-    # 0x0032 (17 bytes) Rowing additional status 1
+    # 0x0032 (17-19 bytes) Rowing additional status 1
     def _handle_0032(self, _uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) < 17:
+        if len(b) != 19 and _uuid == self._uuid80:
+            _LOGGER.debug("Received unexpected length 0x0032 notify: %s", b.hex())
+            return
+        elif len(b) != 17 and _uuid == self._uuid32:
+            _LOGGER.debug("Received unexpected length 0x0032 notify: %s", b.hex())
             return
 
         elapsed_time_s = u24_le(b, 0) / 100.0
@@ -712,7 +1113,18 @@ class PM5BleSession:
         average_pace_s_per_500m = u16_le(b, 9) / 100.0
         rest_distance_m = u16_le(b, 11)
         rest_time_s = u24_le(b, 13) / 100.0
-        erg_type_raw = b[16]
+        if len(b) < 19:
+            avg_power_w = None
+            erg_type_raw = b[16]
+            erg_type = try_lookup(
+                self.address, "erg type", ERG_MACHINE_TYPE, erg_type_raw
+            )
+        else:
+            avg_power_w = u16_le(b, 16)
+            erg_type_raw = b[18]
+            erg_type = try_lookup(
+                self.address, "erg type", ERG_MACHINE_TYPE, erg_type_raw
+            )
 
         self.on_data(
             PM5Data(
@@ -725,30 +1137,42 @@ class PM5BleSession:
                     "0032_average_pace_s_per_500m": average_pace_s_per_500m,
                     "0032_rest_distance_m": rest_distance_m,
                     "0032_rest_time_s": rest_time_s,
-                    "0032_erg_machine_type": ERG_MACHINE_TYPE.get(
-                        erg_type_raw, f"Unknown ({erg_type_raw})"
-                    ),
+                    "0032_avg_power_w": avg_power_w,
+                    "0032_erg_machine_type": erg_type,
                 }
             )
         )
 
-    # 0x0033 (20 bytes) Rowing additional status 2
+    # 0x0033 (18-20 bytes) Rowing additional status 2
     def _handle_0033(self, _uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) < 20:
+        if len(b) != 20 and _uuid == self._uuid33:
+            _LOGGER.debug("Received unexpected length 0x0033 notify: %s", b.hex())
+            return
+        elif len(b) != 18 and _uuid == self._uuid80:
+            _LOGGER.debug("Received unexpected length 0x0033 notify: %s", b.hex())
             return
 
         elapsed_time_s = u24_le(b, 0) / 100.0
         interval_count = b[3]
-        average_power_w = u16_le(b, 4)
-        total_calories = u16_le(b, 6)
-        split_interval_avg_pace_s_per_500m = u16_le(b, 8) / 100.0
-        split_interval_avg_power_w = u16_le(b, 10)
-        split_interval_avg_calories = u16_le(b, 12)
-        last_split_time_s = u24_le(b, 14) / 10.0
-        last_split_distance_m = u24_le(b, 17)
+        if len(b) < 20:
+            average_power_w = None
+            total_calories = u16_le(b, 4)
+            split_interval_avg_pace_s_per_500m = u16_le(b, 6) / 100.0
+            split_interval_avg_power_w = u16_le(b, 8)
+            split_interval_avg_calories = u16_le(b, 10)
+            last_split_time_s = u24_le(b, 12) / 10.0
+            last_split_distance_m = u24_le(b, 15)
+        else:
+            average_power_w = u16_le(b, 4)
+            total_calories = u16_le(b, 6)
+            split_interval_avg_pace_s_per_500m = u16_le(b, 8) / 100.0
+            split_interval_avg_power_w = u16_le(b, 10)
+            split_interval_avg_calories = u16_le(b, 12)
+            last_split_time_s = u24_le(b, 14) / 10.0
+            last_split_distance_m = u24_le(b, 17)
 
         self.on_data(
             PM5Data(
@@ -766,12 +1190,190 @@ class PM5BleSession:
             )
         )
 
-    # 0x0039 (20 bytes) End-of-workout summary
+    # 0x0035 (18-20 bytes) Stroke data
+    def _handle_0035(self, _uuid: str, data: bytearray) -> None:
+        self._bump_seen()
+
+        b = bytes(data)
+        if len(b) != 20 and _uuid == self._uuid35:
+            _LOGGER.debug("Received unexpected length 0x0035 notify: %s", b.hex())
+            return
+        elif len(b) != 18 and _uuid == self._uuid80:
+            _LOGGER.debug("Received unexpected length 0x0035 notify: %s", b.hex())
+            return
+
+        elapsed_time_s = u24_le(b, 0) / 100.0
+        distance_m = u24_le(b, 3) / 10.0
+        drive_length_m = b[6] / 100.0
+        drive_time_s = b[7] / 100.0
+        stroke_recovery_time_s = u16_le(b, 8) / 100.0
+        stroke_distance_m = u16_le(b, 10) / 100.0
+        peak_drive_force = u16_le(b, 12) / 10.0
+        average_drive_force = u16_le(b, 14) / 10.0
+        if len(b) < 20:
+            work_per_stroke_j = None
+            stroke_count = u16_le(b, 16)
+        else:
+            work_per_stroke_j = u16_le(b, 16) / 10.0
+            stroke_count = u16_le(b, 18)
+
+        self.on_data(
+            PM5Data(
+                {
+                    "0035_elapsed_time_s": elapsed_time_s,
+                    "0035_distance_m": distance_m,
+                    "0035_drive_length_m": drive_length_m,
+                    "0035_drive_time_s": drive_time_s,
+                    "0035_stroke_recovery_time_s": stroke_recovery_time_s,
+                    "0035_stroke_distance_m": stroke_distance_m,
+                    "0035_peak_drive_force": peak_drive_force,
+                    "0035_average_drive_force": average_drive_force,
+                    "0035_work_per_stroke_j": work_per_stroke_j,
+                    "0035_stroke_count": stroke_count,
+                }
+            )
+        )
+
+    # 0x0036 (15-17 bytes) Stroke data
+    def _handle_0036(self, _uuid: str, data: bytearray) -> None:
+        self._bump_seen()
+
+        b = bytes(data)
+        if len(b) != 17 and _uuid == self._uuid80:
+            _LOGGER.debug("Received unexpected length 0x0036 notify: %s", b.hex())
+            return
+        elif len(b) != 15 and _uuid == self._uuid36:
+            _LOGGER.debug("Received unexpected length 0x0036 notify: %s", b.hex())
+            return
+
+        elapsed_time_s = u24_le(b, 0) / 100.0
+        stroke_power_w = u16_le(b, 3)
+        stroke_calories_hr = u16_le(b, 5)
+        stroke_count = u16_le(b, 7)
+        projected_work_time_s = u24_le(b, 9)
+        projected_work_distance_m = u24_le(b, 12)
+
+        if len(b) < 17:
+            work_per_stroke_j = None
+        else:
+            work_per_stroke_j = u16_le(b, 15) / 10.0
+
+        self.on_data(
+            PM5Data(
+                {
+                    "0036_elapsed_time_s": elapsed_time_s,
+                    "0036_stroke_power_w": stroke_power_w,
+                    "0036_stroke_calories_hr": stroke_calories_hr,
+                    "0036_stroke_count": stroke_count,
+                    "0036_projected_work_time_s": (
+                        None if projected_work_time_s == 0 else projected_work_time_s
+                    ),
+                    "0036_projected_work_distance_m": (
+                        None
+                        if projected_work_distance_m == 0
+                        else projected_work_distance_m
+                    ),
+                    "0036_work_per_stroke_j": work_per_stroke_j,
+                }
+            )
+        )
+
+    # 0x0037 (18 bytes) Split/interval data
+    def _handle_0037(self, _uuid: str, data: bytearray) -> None:
+        self._bump_seen()
+
+        b = bytes(data)
+        if len(b) < 18 and _uuid in (self._uuid37, self._uuid80):
+            _LOGGER.debug("Received unexpected length 0x0038 notify: %s", b.hex())
+            return
+
+        elapsed_time_s = u24_le(b, 0) / 100.0
+        distance_m = u24_le(b, 3) / 10.0
+        split_interval_time_s = u24_le(b, 6) / 10.0
+        split_interval_distance_m = u24_le(b, 9)
+        interval_rest_time_s = u16_le(b, 12)
+        interval_rest_distance_m = u16_le(b, 14)
+        split_interval_type_raw = b[16]
+        split_interval_type = try_lookup(
+            self.address, "interval type", INTERVAL_TYPE, split_interval_type_raw
+        )
+        split_interval_number = b[17]
+
+        self.on_data(
+            PM5Data(
+                {
+                    "0037_elapsed_time_s": elapsed_time_s,
+                    "0037_distance_m": distance_m,
+                    "0037_split_interval_time_s": split_interval_time_s,
+                    "0037_split_interval_distance_m": split_interval_distance_m,
+                    "0037_interval_rest_time_s": interval_rest_time_s,
+                    "0037_interval_rest_distance_m": interval_rest_distance_m,
+                    "0037_split_interval_type": split_interval_type,
+                    "0037_split_interval_number": split_interval_number,
+                }
+            )
+        )
+
+    # 0x0038 (19 bytes) Split/interval data
+    def _handle_0038(self, _uuid: str, data: bytearray) -> None:
+        self._bump_seen()
+
+        b = bytes(data)
+        if len(b) != 19 and _uuid in (self._uuid38, self._uuid80):
+            _LOGGER.debug("Received unexpected length 0x0038 notify: %s", b.hex())
+            return
+
+        elapsed_time_s = u24_le(b, 0) / 100.0
+        split_interval_avg_stroke_rate_spm = b[3]
+        split_interval_work_heart_rate_bpm = b[4]
+        split_interval_rest_heart_rate_bpm = b[5]
+        split_interval_avg_pace_s_per_500m = u16_le(b, 6) / 10.0
+        split_interval_total_calories = u16_le(b, 8)
+        split_interval_avg_calories_hr = u16_le(b, 10)
+        split_interval_speed_m_s = u16_le(b, 12) / 1000.0
+        split_interval_power_w = u16_le(b, 14)
+        split_avg_drag_factor = b[16]
+        split_interval_number = b[17]
+        erg_type_raw = b[18]
+        erg_type = try_lookup(self.address, "erg type", ERG_MACHINE_TYPE, erg_type_raw)
+
+        self.on_data(
+            PM5Data(
+                {
+                    "0038_elapsed_time_s": elapsed_time_s,
+                    "0038_split_interval_avg_stroke_rate_spm": split_interval_avg_stroke_rate_spm,
+                    "0038_split_interval_work_heart_rate_bpm": (
+                        None
+                        if split_interval_work_heart_rate_bpm in (0, 255)
+                        else split_interval_work_heart_rate_bpm
+                    ),
+                    "0038_split_interval_rest_heart_rate_bpm": (
+                        None
+                        if split_interval_rest_heart_rate_bpm in (0, 255)
+                        else split_interval_rest_heart_rate_bpm
+                    ),
+                    "0038_split_interval_avg_pace_s_per_500m": split_interval_avg_pace_s_per_500m,
+                    "0038_split_interval_total_calories": split_interval_total_calories,
+                    "0038_split_interval_avg_calories_hr": split_interval_avg_calories_hr,
+                    "0038_split_interval_speed_m_s": split_interval_speed_m_s,
+                    "0038_split_interval_power_w": split_interval_power_w,
+                    "0038_split_avg_drag_factor": split_avg_drag_factor,
+                    "0038_split_interval_number": split_interval_number,
+                    "0038_erg_type": erg_type,
+                }
+            )
+        )
+
+    # 0x0039 (18-20 bytes) End-of-workout summary
     def _handle_0039(self, _uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) < 20:
+        if len(b) != 20 and _uuid == self._uuid39:
+            _LOGGER.debug("Received unexpected length 0x0039 notify: %s", b.hex())
+            return
+        elif len(b) != 18 and _uuid == self._uuid80:
+            _LOGGER.debug("Received unexpected length 0x0039 notify: %s", b.hex())
             return
 
         log_date = u16_le(b, 0)
@@ -786,7 +1388,13 @@ class PM5BleSession:
         drag_avg = b[15]
         recovery_hr = b[16]
         workout_type_raw = b[17]
-        avg_pace_s_per_500m = u16_le(b, 18) / 10.0
+        workout_type = try_lookup(
+            self.address, "workout type", WORKOUT_TYPE, workout_type_raw
+        )
+        if len(b) < 20:
+            avg_pace_s_per_500m = None
+        else:
+            avg_pace_s_per_500m = u16_le(b, 18) / 10.0
 
         self.on_data(
             PM5Data(
@@ -806,41 +1414,55 @@ class PM5BleSession:
                     "0039_recovery_heart_rate_bpm": (
                         None if recovery_hr in (0, 255) else recovery_hr
                     ),
-                    "0039_workout_type": WORKOUT_TYPE.get(
-                        workout_type_raw, f"Unknown ({workout_type_raw})"
-                    ),
+                    "0039_workout_type": workout_type,
                     "0039_avg_pace_s_per_500m": avg_pace_s_per_500m,
                 }
             )
         )
 
-    # 0x003A (19 bytes) End-of-workout additional summary
+    # 0x003A (18-19 bytes) End-of-workout additional summary
     def _handle_003A(self, _uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) < 19:
+        if len(b) != 19 and _uuid == self._uuid3a:
+            _LOGGER.debug("Received unexpected length 0x003A notify: %s", b.hex())
+            return
+        elif len(b) != 18 and _uuid == self._uuid80:
+            _LOGGER.debug("Received unexpected length 0x003A notify: %s", b.hex())
             return
 
         log_date = u16_le(b, 0)
         log_time = u16_le(b, 2)
-        split_interval_type_raw = b[4]
-        split_interval_size = u16_le(b, 5)
-        split_interval_count = b[7]
-        total_calories = u16_le(b, 8)
-        avg_power_w = u16_le(b, 10)
-        total_rest_distance_m = u24_le(b, 12)
-        interval_rest_time_s = u16_le(b, 15)
-        avg_calories_per_hr = u16_le(b, 17)
+        if len(b) < 19:
+            split_interval_type_raw = None
+            split_interval_type = None
+            split_interval_size = u16_le(b, 4)
+            split_interval_count = b[6]
+            total_calories = u16_le(b, 7)
+            avg_power_w = u16_le(b, 9)
+            total_rest_distance_m = u24_le(b, 11)
+            interval_rest_time_s = u16_le(b, 14)
+            avg_calories_per_hr = u16_le(b, 16)
+        else:
+            split_interval_type_raw = b[4]
+            split_interval_type = try_lookup(
+                self.address, "interval type", INTERVAL_TYPE, split_interval_type_raw
+            )
+            split_interval_size = u16_le(b, 5)
+            split_interval_count = b[7]
+            total_calories = u16_le(b, 8)
+            avg_power_w = u16_le(b, 10)
+            total_rest_distance_m = u24_le(b, 12)
+            interval_rest_time_s = u16_le(b, 15)
+            avg_calories_per_hr = u16_le(b, 17)
 
         self.on_data(
             PM5Data(
                 {
                     "003a_log_entry_date": log_date,
                     "003a_log_entry_time": log_time,
-                    "003a_split_interval_type": INTERVAL_TYPE.get(
-                        split_interval_type_raw, f"Unknown ({split_interval_type_raw})"
-                    ),
+                    "003a_split_interval_type": split_interval_type,
                     "003a_split_interval_size": split_interval_size,
                     "003a_split_interval_count": split_interval_count,
                     "003a_total_calories": total_calories,

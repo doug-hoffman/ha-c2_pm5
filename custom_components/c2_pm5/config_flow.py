@@ -58,7 +58,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         assert self._discovered_address is not None
 
         if user_input is not None:
-            address = self._discovered_address
             device_type = user_input[CONF_DEVICE_TYPE]
 
             return self.async_create_entry(
