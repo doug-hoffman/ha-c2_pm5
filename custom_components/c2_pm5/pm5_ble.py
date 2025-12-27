@@ -49,6 +49,7 @@ from .const import (
     TERMINATE_GRACE_SECONDS,
     TERMINATE_RATE_LIMIT_SECONDS,
     TERMINATE_WORKOUT_CONTENTS,
+    WORKOUT_DURATION_TYPE,
     WORKOUT_STATE,
     WORKOUT_TYPE,
 )
@@ -543,9 +544,13 @@ class PM5BleSession:
 
             # Optional: subscribe to CSAFE TX notifications (responses), if supported
             try:
-                await self._client.start_notify(self._uuid_csafe_tx, self._handle_csafe_tx)
+                await self._client.start_notify(
+                    self._uuid_csafe_tx, self._handle_csafe_tx
+                )
             except Exception as err:
-                _LOGGER.debug("CSAFE TX notify not available (%s): %s", self.address, err)
+                _LOGGER.debug(
+                    "CSAFE TX notify not available (%s): %s", self.address, err
+                )
 
             _LOGGER.info("Connected to PM5 (%s)", self.address)
             self._set_connected(True)
@@ -583,7 +588,8 @@ class PM5BleSession:
                     await self._terminate_workout()
                 except Exception:
                     _LOGGER.exception(
-                        "Unexpected error during PM5 workout termination (%s)", self.address
+                        "Unexpected error during PM5 workout termination (%s)",
+                        self.address,
                     )
 
                 # Give PM a moment to emit end-of-workout summaries (0039/003A)
@@ -602,7 +608,12 @@ class PM5BleSession:
             if client is not None:
                 # Best-effort notify stop
                 for uuid in (
-                    self._uuid31, self._uuid32, self._uuid33, self._uuid39, self._uuid3a, self._uuid_csafe_tx
+                    self._uuid31,
+                    self._uuid32,
+                    self._uuid33,
+                    self._uuid39,
+                    self._uuid3a,
+                    self._uuid_csafe_tx,
                 ):
                     try:
                         await client.stop_notify(uuid)
@@ -623,12 +634,12 @@ class PM5BleSession:
         self._bump_seen()
         _LOGGER.debug("CSAFE TX (%s): %s", self.address, bytes(data).hex())
 
-    # 0x0031 (11 bytes) Rowing general status
+    # 0x0031 (19 bytes) Rowing general status
     def _handle_0031(self, _uuid: str, data: bytearray) -> None:
         self._bump_seen()
 
         b = bytes(data)
-        if len(b) < 11:
+        if len(b) < 19:
             return
 
         elapsed_time_s = u24_le(b, 0) / 100.0
@@ -638,6 +649,10 @@ class PM5BleSession:
         workout_state_raw = b[8]
         rowing_state_raw = b[9]
         stroke_state_raw = b[10]
+        total_work_distance_m = u24_le(b, 11)
+        workout_duration = u24_le(b, 14)
+        workout_duration_type_raw = b[17]
+        drag_factor = b[18]
 
         # Track workout state for terminate gating
         self._workout_state_raw = workout_state_raw
@@ -666,6 +681,17 @@ class PM5BleSession:
                     "0031_stroke_state": STROKE_STATE.get(
                         stroke_state_raw, f"Unknown ({stroke_state_raw})"
                     ),
+                    "0031_total_work_distance_m": total_work_distance_m,
+                    "0031_workout_duration": (
+                        workout_duration
+                        if workout_duration_type_raw != 0
+                        else (workout_duration / 100)
+                    ),
+                    "0031_workout_duration_type": WORKOUT_DURATION_TYPE.get(
+                        workout_duration_type_raw,
+                        f"Unknown ({workout_duration_type_raw})",
+                    ),
+                    "0031_drag_factor": drag_factor,
                 }
             )
         )
@@ -773,9 +799,9 @@ class PM5BleSession:
                     "0039_ending_heart_rate_bpm": (
                         None if ending_hr in (0, 255) else ending_hr
                     ),
-                    "0039_avg_heart_rate_bpm": None if avg_hr in (0, 255) else avg_hr,
-                    "0039_min_heart_rate_bpm": None if min_hr in (0, 255) else min_hr,
-                    "0039_max_heart_rate_bpm": None if max_hr in (0, 255) else max_hr,
+                    "0039_avg_heart_rate_bpm": (None if avg_hr in (0, 255) else avg_hr),
+                    "0039_min_heart_rate_bpm": (None if min_hr in (0, 255) else min_hr),
+                    "0039_max_heart_rate_bpm": (None if max_hr in (0, 255) else max_hr),
                     "0039_drag_factor_avg": drag_avg,
                     "0039_recovery_heart_rate_bpm": (
                         None if recovery_hr in (0, 255) else recovery_hr

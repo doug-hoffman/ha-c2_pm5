@@ -77,6 +77,33 @@ SENSORS: list[PM5SensorDescription] = [
         name="Stroke State",
         icon="mdi:waveform",
     ),
+    PM5SensorDescription(
+        key="0031_total_work_distance_m",
+        name="Total Work Distance",
+        native_unit_of_measurement=UnitOfLength.METERS,
+        suggested_unit_of_measurement=UnitOfLength.FEET,
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        icon="mdi:map-marker-distance",
+    ),
+    PM5SensorDescription(
+        key="0031_workout_duration",
+        name="Workout Duration",
+        icon="mdi:ruler",
+    ),
+    PM5SensorDescription(
+        key="0031_workout_duration_type",
+        name="Workout Duration Type",
+        icon="mdi:timeline-clock-outline",
+    ),
+    PM5SensorDescription(
+        key="0031_drag_factor",
+        name="Drag Factor",
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
+        icon="mdi:fan",
+    ),
     # ---------- 0x0032 : Performance / live metrics ----------
     PM5SensorDescription(
         key="0032_speed_m_s",

@@ -139,3 +139,10 @@ ERG_MACHINE_TYPE = {
     225: "MultiErg ski",
     226: "MultiErg bike",
 }
+
+WORKOUT_DURATION_TYPE = {
+    0: "Time",
+    64: "Calories",
+    128: "Distance",
+    192: "Watt-minute",
+}
